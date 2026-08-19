@@ -105,8 +105,10 @@ internal sealed class MainForm : Form
             discord.Refresh();
             if (discord.MainWindowHandle == IntPtr.Zero)
                 throw new InvalidOperationException("A janela do Discord desapareceu antes da recarga.");
-            if (!NativeInput.SendCtrlR(discord.MainWindowHandle))
-                throw new InvalidOperationException("O Windows não permitiu colocar o Discord em primeiro plano.");
+            var foreground = NativeInput.SendCtrlR(discord.MainWindowHandle);
+            Log(foreground
+                ? "Ctrl+R enviado com o Discord em primeiro plano."
+                : "O Windows bloqueou o foco; Ctrl+R enviado diretamente à janela do Discord.");
 
             Log("Ctrl+R enviado. Mantendo o proxy por 15 segundos...");
             for (var remaining = 15; remaining > 0; remaining--)
@@ -360,17 +362,58 @@ internal static class NativeInput
     private const ushort VkR = 0x52;
     private const uint KeyUp = 0x0002;
     private const uint InputKeyboard = 1;
+    private const uint WmKeyDown = 0x0100;
+    private const uint WmKeyUp = 0x0101;
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private static readonly IntPtr HwndNotTopmost = new(-2);
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpShowWindow = 0x0040;
 
     public static bool SendCtrlR(IntPtr window)
     {
-        ShowWindowAsync(window, SwRestore);
-        SetForegroundWindow(window);
+        var currentThread = GetCurrentThreadId();
+        var targetThread = GetWindowThreadProcessId(window, out _);
+        var foregroundWindow = GetForegroundWindow();
+        var foregroundThread = foregroundWindow == IntPtr.Zero
+            ? 0u : GetWindowThreadProcessId(foregroundWindow, out _);
+        var attachedTarget = targetThread != 0 && targetThread != currentThread &&
+                             AttachThreadInput(currentThread, targetThread, true);
+        var attachedForeground = foregroundThread != 0 && foregroundThread != currentThread &&
+                                 foregroundThread != targetThread &&
+                                 AttachThreadInput(currentThread, foregroundThread, true);
+        try
+        {
+            ShowWindowAsync(window, SwRestore);
+            SetWindowPos(window, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
+            SetWindowPos(window, HwndNotTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
+            BringWindowToTop(window);
+            SetForegroundWindow(window);
+            SetFocus(window);
+        }
+        finally
+        {
+            if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+            if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+        }
         Thread.Sleep(700);
-        if (GetForegroundWindow() != window) return false;
+        if (GetForegroundWindow() != window)
+        {
+            // Electron normalmente aceita esta sequência mesmo quando o Windows
+            // impede que um aplicativo roube o foco da janela atual.
+            PostMessage(window, WmKeyDown, (IntPtr)VkControl, IntPtr.Zero);
+            PostMessage(window, WmKeyDown, (IntPtr)VkR, IntPtr.Zero);
+            Thread.Sleep(80);
+            PostMessage(window, WmKeyUp, (IntPtr)VkR, IntPtr.Zero);
+            PostMessage(window, WmKeyUp, (IntPtr)VkControl, IntPtr.Zero);
+            return false;
+        }
         var inputs = new[] {
             Key(VkControl, 0), Key(VkR, 0), Key(VkR, KeyUp), Key(VkControl, KeyUp)
         };
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) == inputs.Length;
+        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) != inputs.Length)
+            throw new InvalidOperationException("O Windows recusou a entrada de teclado para o Discord.");
+        return true;
     }
 
     private static INPUT Key(ushort code, uint flags) => new() {
@@ -385,5 +428,12 @@ internal static class NativeInput
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
 }
