@@ -361,7 +361,6 @@ internal static class NativeInput
     private const ushort VkControl = 0x11;
     private const ushort VkR = 0x52;
     private const uint KeyUp = 0x0002;
-    private const uint InputKeyboard = 1;
     private const uint WmKeyDown = 0x0100;
     private const uint WmKeyUp = 0x0101;
     private static readonly IntPtr HwndTopmost = new(-1);
@@ -408,22 +407,12 @@ internal static class NativeInput
             PostMessage(window, WmKeyUp, (IntPtr)VkControl, IntPtr.Zero);
             return false;
         }
-        var inputs = new[] {
-            Key(VkControl, 0), Key(VkR, 0), Key(VkR, KeyUp), Key(VkControl, KeyUp)
-        };
-        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>()) != inputs.Length)
-            throw new InvalidOperationException("O Windows recusou a entrada de teclado para o Discord.");
+        keybd_event((byte)VkControl, 0, 0, UIntPtr.Zero);
+        keybd_event((byte)VkR, 0, 0, UIntPtr.Zero);
+        Thread.Sleep(80);
+        keybd_event((byte)VkR, 0, KeyUp, UIntPtr.Zero);
+        keybd_event((byte)VkControl, 0, KeyUp, UIntPtr.Zero);
         return true;
-    }
-
-    private static INPUT Key(ushort code, uint flags) => new() {
-        type = InputKeyboard, U = new InputUnion { ki = new KEYBDINPUT { wVk = code, dwFlags = flags } }
-    };
-
-    [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public InputUnion U; }
-    [StructLayout(LayoutKind.Explicit)] private struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; }
-    [StructLayout(LayoutKind.Sequential)] private struct KEYBDINPUT {
-        public ushort wVk, wScan; public uint dwFlags, time; public UIntPtr dwExtraInfo;
     }
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
@@ -435,5 +424,5 @@ internal static class NativeInput
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] private static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
 }

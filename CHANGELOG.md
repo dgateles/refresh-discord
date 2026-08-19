@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- Substitui `SendInput` por `keybd_event`, o mesmo metodo que funcionou no prototipo.
+- Evita que a recarga seja cancelada quando o Windows bloqueia `SendInput`.
+
 ## 1.0.1
 
 - Corrige a ativacao da janela do Discord em sistemas com bloqueio de foco.
