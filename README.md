@@ -31,4 +31,4 @@ Proxies públicos são instáveis e podem observar IP, horário e destinos, embo
 
 ## Desenvolvimento
 
-Abra `DiscordRefreshProxy.vcxproj` no Visual Studio com **Desktop development with C++**, ou use MSBuild. O projeto não fixa uma versão de toolset: utiliza automaticamente a versão disponível no ambiente de compilação. O código do projeto usa licença MIT.
+Abra `DiscordRefreshProxy.vcxproj` no Visual Studio com **Desktop development with C++**, ou use MSBuild. O projeto seleciona `v143` no Visual Studio 2022 e `v145` no Visual Studio 2026. O código do projeto usa licença MIT.
