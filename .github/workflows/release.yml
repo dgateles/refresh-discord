@@ -1,0 +1,53 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        runtime: [win-x64, win-arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Publish single EXE
+        shell: pwsh
+        run: dotnet publish DiscordRefreshProxy.csproj -c Release -r ${{ matrix.runtime }} --self-contained true -p:PublishSingleFile=true -o artifacts/${{ matrix.runtime }}
+      - name: Rename and checksum
+        shell: pwsh
+        run: |
+          $name = "DiscordRefreshProxy-${{ matrix.runtime }}.exe"
+          Move-Item "artifacts/${{ matrix.runtime }}/DiscordRefreshProxy.exe" "artifacts/$name"
+          $hash = (Get-FileHash "artifacts/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content "artifacts/$name.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiscordRefreshProxy-${{ matrix.runtime }}
+          path: |
+            artifacts/DiscordRefreshProxy-${{ matrix.runtime }}.exe
+            artifacts/DiscordRefreshProxy-${{ matrix.runtime }}.exe.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" release/* --repo "${{ github.repository }}" --generate-notes --title "Discord Refresh Proxy ${{ github.ref_name }}"
+
