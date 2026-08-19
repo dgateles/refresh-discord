@@ -1,49 +1,34 @@
 # Discord Refresh Proxy
 
-Aplicativo Windows de um clique que:
+Aplicativo nativo C++/Win32 de um clique. Não requer .NET, PowerShell ou instalação e não abre console.
 
-1. encontra e testa um proxy público estrangeiro com HTTPS;
-2. encaminha temporariamente apenas o TCP dos processos do Discord;
-3. coloca o Discord em primeiro plano e envia `Ctrl+R`;
-4. aguarda 15 segundos;
-5. encerra o túnel e apaga a configuração temporária.
-
-Não usa WireGuard, não altera região, idade ou pagamento da conta e não mantém o proxy conectado. Nenhuma janela de PowerShell ou terminal é aberta.
+Ele encontra um proxy público estrangeiro com HTTPS, encaminha temporariamente apenas o TCP do Discord, envia `Ctrl+R`, mantém o proxy por 45 segundos após a recarga e encerra o túnel. Durante a espera, confirma periodicamente que o túnel continua ativo. O sing-box é baixado separadamente na primeira execução, validado por SHA-256 e armazenado em `%LOCALAPPDATA%\DiscordRefreshProxy`.
 
 ## Uso
 
-1. Baixe `DiscordRefreshProxy-win-x64.exe` na página **Releases**.
+1. Baixe `DiscordRefreshProxy-x64.exe` em **Releases**.
 2. Abra o Discord.
-3. Execute o programa e aceite o pedido de Administrador, necessário para o adaptador TUN.
-4. Clique em **DESBLOQUEAR DISCORD AGORA**.
+3. Execute o programa, aceite a elevação de Administrador e clique no botão.
 
-Na primeira execução, o programa baixa o release estável oficial do [sing-box](https://github.com/SagerNet/sing-box), valida o SHA-256 publicado pelo GitHub e o guarda em `%LOCALAPPDATA%\DiscordRefreshProxy`. A lista de proxies vem da [API pública do ProxyScrape](https://docs.proxyscrape.com/api-reference/public-api/get-proxy-list).
-
-## Publicar no GitHub
-
-Crie um repositório e envie estes arquivos. Para gerar uma release:
+## Publicar
 
 ```text
-git tag v1.0.0
-git push origin v1.0.0
+git add .
+git commit -m "Native Win32 release"
+git push origin main
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
-O workflow compila executáveis únicos e autocontidos para Windows x64 e ARM64, gera seus SHA-256 e cria a release automaticamente. Também é possível executar **Build release** manualmente na aba Actions; nesse caso os executáveis ficam em Artifacts, sem criar uma release.
+O GitHub Actions compila x64 e ARM64 com runtime C++ estático, incorpora o ícone de cadeado aberto e publica os checksums. O executável esperado tem poucos megabytes ou menos; o tamanho exato aparece após o build.
 
-## Observações
+## Fontes externas
 
-- Proxies públicos são instáveis; o aplicativo testa vários automaticamente.
-- Nenhum certificado de proxy é instalado. O Discord continua usando TLS.
-- O operador do proxy pode observar IP, horário e destinos, ainda que não veja o conteúdo TLS.
-- O desbloqueio só altera temporariamente a origem de rede/IP. Restrições vinculadas ao backend da conta podem permanecer.
-- Os logs locais do sing-box ficam em `%LOCALAPPDATA%\DiscordRefreshProxy\logs`.
+- [sing-box](https://github.com/SagerNet/sing-box), baixado em tempo de execução e sujeito à própria licença.
+- [ProxyScrape Public API](https://docs.proxyscrape.com/api-reference/public-api/get-proxy-list).
+
+Proxies públicos são instáveis e podem observar IP, horário e destinos, embora nenhum certificado seja instalado e o Discord continue usando TLS. A ferramenta altera somente a origem de rede temporária; não modifica dados da conta.
 
 ## Desenvolvimento
 
-Requer .NET 8 SDK no Windows:
-
-```text
-dotnet run
-```
-
-Licença MIT. O sing-box é baixado separadamente em tempo de execução e mantém sua própria licença.
+Abra `DiscordRefreshProxy.vcxproj` no Visual Studio 2022 com **Desktop development with C++**, ou use MSBuild. O código do projeto usa licença MIT.

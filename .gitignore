@@ -1,7 +1,6 @@
-bin/
-obj/
 .vs/
+obj/
+artifacts/
 *.user
 *.suo
-artifacts/
 
