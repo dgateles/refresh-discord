@@ -4,6 +4,8 @@ Aplicativo nativo C++/Win32 de um clique. Não requer .NET, PowerShell, instala�
 
 Ele encontra um proxy público estrangeiro com HTTPS, aplica esse proxy **somente aos domínios do Discord** por meio de um arquivo PAC temporário, envia `Ctrl+R`, mantém o proxy pelos 45 segundos que o Discord leva para voltar por completo e remove a configuração. Durante a espera, confirma periodicamente que o proxy continua respondendo. Todo o resto da navegação continua direto o tempo todo.
 
+Um proxy só é aceito se conseguir entregar o HTML de `discord.com/app` — a mesma página que o `Ctrl+R` baixa — e não apenas responder a uma chamada de API. Depois da recarga, o programa acompanha o título da janela para saber se o Discord voltou de verdade ou parou na tela cinza; quando para, o proxy vai para `blocked.txt` em `%LOCALAPPDATA%\DiscordRefreshProxy` e nunca mais é escolhido, e a tentativa recomeça com o próximo aprovado (até três por clique).
+
 O PAC é servido em `127.0.0.1` numa porta efêmera e apontado pelo `AutoConfigURL` do usuário atual (`HKCU`), que é como o Chromium — e portanto o Discord, que é Electron — resolve proxy no Windows. O valor anterior do `AutoConfigURL` é salvo em `%LOCALAPPDATA%\DiscordRefreshProxy` e restaurado ao final; se o programa for encerrado à força, a execução seguinte restaura sozinha.
 
 ## Uso

@@ -9,6 +9,7 @@
 #include <future>
 #include <regex>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,8 +26,10 @@ constexpr UINT WM_LOG=WM_APP+1,WM_DONE=WM_APP+2;
 constexpr wchar_t kInternetSettings[]=L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 constexpr wchar_t kPacPath[]=L"/discord-refresh.pac"; // também serve de marca para limpar sobras de uma execução que morreu
 constexpr wchar_t kBackupName[]=L"previous-autoconfig.txt";
+constexpr wchar_t kBlockedName[]=L"blocked.txt";
 constexpr int kHoldSeconds=45;                        // cobre o ciclo todo: recarga, reconexão do gateway e carga das guilds. Valor calibrado no uso real.
-constexpr size_t kProbeBatch=8,kProbeLimit=24;
+constexpr int kVerifySeconds=20;                      // parte inicial da espera: tempo dado ao Discord para voltar antes de julgar o proxy
+constexpr size_t kProbeBatch=8,kProbeLimit=24,kMaxAttempts=3;
 HWND g_main{},g_log{},g_button{},g_status{},g_progress{};
 
 // wininet.h e winhttp.h não convivem no mesmo arquivo (INTERNET_* colidem), então a única função que falta vem declarada a mão.
@@ -123,24 +126,52 @@ std::vector<Proxy> Fetch(std::wstring code,std::wstring country){
  try{auto b=Get(L"https://api.proxyscrape.com/v4/free-proxy-list/get?request=getproxies&protocol=http&country="+code+L"&timeout=5000&ssl=yes&anonymity=elite,anonymous&limit=80");
   return ParseProxies(std::string(b.begin(),b.end()),country);}catch(...){return {};}
 }
-bool Probe(std::wstring host,int port){try{Get(L"https://discord.com/api/v10/gateway",host+L":"+std::to_wstring(port),7000);return true;}catch(...){return false;}}
+// Duas etapas de proposito: o gateway prova alcance, e o HTML do /app e o que o Ctrl+R realmente baixa.
+// Um proxy que passa no primeiro mas engasga no segundo e exatamente o que deixa o Discord na tela cinza.
+bool Probe(std::wstring host,int port){
+ std::wstring via=host+L":"+std::to_wstring(port);
+ try{Get(L"https://discord.com/api/v10/gateway",via,5000);return Get(L"https://discord.com/app",via,6000).size()>1024;}catch(...){return false;}
+}
+std::wstring Title(HWND w){wchar_t b[512]{};GetWindowTextW(w,b,512);return b;}
+// Veredito conservador: so acusa tela cinza se o titulo saiu do que era e nao voltou.
+// Falso negativo custa uma tentativa a mais; falso positivo descartaria um proxy bom para sempre.
+struct ReloadWatch{
+ std::wstring good;bool changed{};
+ explicit ReloadWatch(std::wstring t):good(std::move(t)){}
+ bool Reloaded(const std::wstring&now){if(now!=good){changed=true;return false;}return changed;}
+ bool AcceptOnTimeout()const{return !changed;}
+};
+bool WaitReload(HWND w,const std::wstring&good,int seconds){
+ ReloadWatch watch(good);
+ for(int i=0;i<seconds*2;++i){Sleep(500);if(watch.Reloaded(Title(w)))return true;}
+ return watch.AcceptOnTimeout();
+}
+std::string Key(const Proxy&p){return Utf8(p.host)+":"+std::to_string(p.port);}
+std::set<std::string> LoadBlocked(){std::set<std::string> out;try{std::ifstream f(Root()/kBlockedName);for(std::string line;std::getline(f,line);)if(!line.empty())out.insert(line);}catch(...){}return out;}
+void Block(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Root()/kBlockedName,std::ios::app)<<Key(p)<<"\n";}catch(...){}}
 Proxy LoadLast(){try{std::ifstream f(Root()/L"last-proxy.txt");std::string line;if(!std::getline(f,line))return{};size_t colon=line.rfind(':');if(colon==std::string::npos)return{};return{Wide(line.substr(0,colon)),std::stoi(line.substr(colon+1)),L"último aprovado"};}catch(...){return{};}}
 void SaveLast(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Root()/L"last-proxy.txt")<<Utf8(p.host)<<":"<<p.port;}catch(...){}}
 
-Proxy FindProxy(){
+// Devolve todos os aprovados da primeira rodada com sucesso: se o primeiro nao recarregar o Discord, ha suplentes prontos.
+std::vector<Proxy> FindProxies(){
  std::vector<std::pair<std::wstring,std::wstring>> countries={{L"US",L"Estados Unidos"},{L"CA",L"Canadá"},{L"NL",L"Países Baixos"},{L"DE",L"Alemanha"},{L"FR",L"França"},{L"GB",L"Reino Unido"},{L"JP",L"Japão"},{L"SG",L"Singapura"}};
  Log(L"Buscando listas de proxies em "+std::to_wstring(countries.size())+L" países...");
  std::vector<std::future<std::vector<Proxy>>> lists;for(auto&c:countries)lists.push_back(std::async(std::launch::async,Fetch,c.first,c.second));
  std::vector<Proxy> pool;for(auto&l:lists){auto found=l.get();pool.insert(pool.end(),found.begin(),found.end());}
  if(pool.empty())throw std::runtime_error("Nenhuma lista pública de proxies respondeu");
+ std::set<std::string> blocked=LoadBlocked();size_t before=pool.size();
+ pool.erase(std::remove_if(pool.begin(),pool.end(),[&](const Proxy&p){return blocked.count(Key(p))>0;}),pool.end());
+ if(size_t cut=before-pool.size();cut)Log(L"Ignorando "+std::to_wstring(cut)+L" proxies que já falharam antes.");
+ if(pool.empty())throw std::runtime_error("Todos os proxies encontrados já falharam antes. Tente novamente mais tarde.");
  std::mt19937 rng((unsigned)GetTickCount64());std::shuffle(pool.begin(),pool.end(),rng);
- if(Proxy last=LoadLast();!last.host.empty())pool.insert(pool.begin(),last);
+ if(Proxy last=LoadLast();!last.host.empty()&&!blocked.count(Key(last)))pool.insert(pool.begin(),last);
  Log(L"Testando até "+std::to_wstring(kProbeLimit)+L" proxies contra o Discord...");
  for(size_t start=0,limit=(std::min)(pool.size(),kProbeLimit);start<limit;start+=kProbeBatch){
   size_t end=(std::min)(start+kProbeBatch,limit);
   std::vector<std::future<bool>> probes;for(size_t i=start;i<end;++i)probes.push_back(std::async(std::launch::async,Probe,pool[i].host,pool[i].port));
   std::vector<char> alive(probes.size());for(size_t i=0;i<probes.size();++i)alive[i]=probes[i].get()?1:0;
-  for(size_t i=0;i<alive.size();++i)if(alive[i]){SaveLast(pool[start+i]);return pool[start+i];}
+  std::vector<Proxy> ok;for(size_t i=0;i<alive.size();++i)if(alive[i])ok.push_back(pool[start+i]);
+  if(!ok.empty())return ok;
   Log(L"  Nenhum respondeu nesta rodada, tentando a próxima...");
  }
  throw std::runtime_error("Nenhum proxy público funcional encontrado. Tente novamente.");
@@ -153,20 +184,35 @@ void Refresh(HWND w){ShowWindowAsync(w,SW_RESTORE);SetWindowPos(w,HWND_TOPMOST,0
 DWORD WINAPI Worker(LPVOID){
  try{
   HWND discord=Discord();if(!discord)throw std::runtime_error("Abra o Discord antes de continuar");Log(L"Discord encontrado.");
-  Proxy proxy=FindProxy();Log(L"Proxy aprovado: "+proxy.host+L":"+std::to_wstring(proxy.port)+L" - "+proxy.country);
-  Pac pac;pac.Start(PacScript(proxy));
-  ProxyScope scope(L"http://127.0.0.1:"+std::to_wstring(pac.port)+kPacPath);
-  Log(L"Proxy aplicado somente aos domínios do Discord.");
-  Log(pac.WaitFetch(4000)?L"Discord leu a configuração.":L"Sem confirmação de leitura, seguindo assim mesmo.");
-  Refresh(discord);Log(L"Discord recarregado. Mantendo o proxy por "+std::to_wstring(kHoldSeconds)+L"s até ele voltar por completo...");
-  // Um proxy público pode morrer no meio da recarga; sem esse teste o usuário veria "concluído" com o Discord pela metade.
-  for(int remaining=kHoldSeconds;remaining>0;--remaining){
-   SetWindowTextW(g_status,(L"AGUARDE "+std::to_wstring(remaining)+L"s").c_str());Sleep(1000);
-   if(remaining>1&&remaining%15==0&&!Probe(proxy.host,proxy.port))throw std::runtime_error("O proxy caiu antes de a recarga terminar");
+  std::wstring good=Title(discord); // título com o Discord carregado: é a ele que a janela precisa voltar depois do Ctrl+R
+  std::vector<Proxy> candidates=FindProxies();
+  Log(std::to_wstring(candidates.size())+L" proxy(s) passaram no teste de carga.");
+  for(size_t attempt=0;attempt<candidates.size()&&attempt<kMaxAttempts;++attempt){
+   const Proxy&proxy=candidates[attempt];
+   Log(L"Tentativa "+std::to_wstring(attempt+1)+L": "+proxy.host+L":"+std::to_wstring(proxy.port)+L" - "+proxy.country);
+   Pac pac;pac.Start(PacScript(proxy));
+   ProxyScope scope(L"http://127.0.0.1:"+std::to_wstring(pac.port)+kPacPath);
+   Log(pac.WaitFetch(4000)?L"Discord leu a configuração.":L"Sem confirmação de leitura, seguindo assim mesmo.");
+   ULONGLONG began=GetTickCount64();
+   Refresh(discord);SetWindowTextW(g_status,L"RECARREGANDO");
+   if(!WaitReload(discord,good,kVerifySeconds)){
+    Block(proxy);Log(L"O Discord não voltou da recarga (tela cinza). Proxy descartado de vez.");
+    continue; // o PAC deste proxy sai de cena aqui, antes da próxima tentativa
+   }
+   Log(L"Recarga confirmada. Segurando o proxy até completar os "+std::to_wstring(kHoldSeconds)+L"s.");
+   // Um proxy público pode morrer no meio; sem esse teste o usuário veria "concluído" com o Discord pela metade.
+   for(int lastProbe=kHoldSeconds;;){
+    int remaining=kHoldSeconds-(int)((GetTickCount64()-began)/1000);
+    if(remaining<=0)break;
+    SetWindowTextW(g_status,(L"AGUARDE "+std::to_wstring(remaining)+L"s").c_str());Sleep(1000);
+    if(lastProbe-remaining>=15){lastProbe=remaining;if(!Probe(proxy.host,proxy.port))throw std::runtime_error("O proxy caiu antes de a recarga terminar");}
+   }
+   SaveLast(proxy);scope.Release();
+   Log(L"Configuração lida "+std::to_wstring(pac.hits.load())+L" vez(es). Proxy removido.");
+   Log(L"Concluído usando saída em "+proxy.country+L".");
+   PostMessage(g_main,WM_DONE,TRUE,0);return 0;
   }
-  scope.Release();Log(L"Configuração lida "+std::to_wstring(pac.hits.load())+L" vez(es). Proxy removido.");
-  Log(L"Concluído usando saída em "+proxy.country+L".");
-  PostMessage(g_main,WM_DONE,TRUE,0);
+  throw std::runtime_error("Nenhum proxy conseguiu recarregar o Discord. Clique de novo para tentar com outros.");
  }catch(const std::exception&e){Log(L"ERRO: "+Wide(e.what()));PostMessage(g_main,WM_DONE,FALSE,0);}
  return 0;
 }
@@ -179,6 +225,16 @@ int SelfTest(){
  auto parsed=ParseProxies("1.2.3.4:8080\r\nlixo sem porta\r\n10.0.0.1:3128\n",L"teste");
  if(parsed.size()!=2||parsed[0].port!=8080||parsed[0].host!=L"1.2.3.4"||parsed[1].host!=L"10.0.0.1"||parsed[1].port!=3128)return 1;
  if(!ParseProxies("nada aqui",L"teste").empty())return 1;
+ ReloadWatch voltou(L"#geral | Servidor");
+ if(voltou.Reloaded(L"#geral | Servidor"))return 1;   // ainda não mudou: nada a declarar
+ if(voltou.Reloaded(L"Discord"))return 1;             // entrou em carga
+ if(!voltou.Reloaded(L"#geral | Servidor"))return 1;  // voltou ao que era: recarregou
+ ReloadWatch cinza(L"#geral | Servidor");
+ cinza.Reloaded(L"Discord");
+ if(cinza.AcceptOnTimeout())return 1;                 // mudou e não voltou: tela cinza, descarta o proxy
+ ReloadWatch mudo(L"Discord");
+ mudo.Reloaded(L"Discord");
+ if(!mudo.AcceptOnTimeout())return 1;                 // título nunca mudou: inconclusivo, não culpa o proxy
  return 0;
 }
 
