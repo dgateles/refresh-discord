@@ -1,14 +1,16 @@
 # Discord Refresh Proxy
 
-Aplicativo nativo C++/Win32 de um clique. Não requer .NET, PowerShell ou instalação e não abre console.
+Aplicativo nativo C++/Win32 de um clique. Não requer .NET, PowerShell, instalação, Administrador ou download adicional, e não abre console.
 
-Ele encontra um proxy público estrangeiro com HTTPS, encaminha temporariamente apenas o TCP do Discord, envia `Ctrl+R`, mantém o proxy por 45 segundos após a recarga e encerra o túnel. Durante a espera, confirma periodicamente que o túnel continua ativo. O sing-box é baixado separadamente na primeira execução, validado por SHA-256 e armazenado em `%LOCALAPPDATA%\DiscordRefreshProxy`.
+Ele encontra um proxy público estrangeiro com HTTPS, aplica esse proxy **somente aos domínios do Discord** por meio de um arquivo PAC temporário, envia `Ctrl+R`, mantém o proxy pelos 45 segundos que o Discord leva para voltar por completo e remove a configuração. Durante a espera, confirma periodicamente que o proxy continua respondendo. Todo o resto da navegação continua direto o tempo todo.
+
+O PAC é servido em `127.0.0.1` numa porta efêmera e apontado pelo `AutoConfigURL` do usuário atual (`HKCU`), que é como o Chromium — e portanto o Discord, que é Electron — resolve proxy no Windows. O valor anterior do `AutoConfigURL` é salvo em `%LOCALAPPDATA%\DiscordRefreshProxy` e restaurado ao final; se o programa for encerrado à força, a execução seguinte restaura sozinha.
 
 ## Uso
 
 1. Baixe `DiscordRefreshProxy-x64.exe` em **Releases**.
 2. Abra o Discord.
-3. Execute o programa, aceite a elevação de Administrador e clique no botão.
+3. Execute o programa e clique no botão. Não há prompt de elevação.
 
 ## Publicar
 
@@ -20,14 +22,19 @@ git tag v2.0.0
 git push origin v2.0.0
 ```
 
-O GitHub Actions compila x64 e ARM64 com runtime C++ estático, incorpora o ícone de cadeado aberto e publica os checksums. O executável esperado tem poucos megabytes ou menos; o tamanho exato aparece após o build.
+O GitHub Actions compila x64 e ARM64 com runtime C++ estático, roda o autoteste (`--selftest`), incorpora o ícone de cadeado aberto e publica os checksums. O executável esperado tem poucos megabytes ou menos; o tamanho exato aparece após o build.
 
 ## Fontes externas
 
-- [sing-box](https://github.com/SagerNet/sing-box), baixado em tempo de execução e sujeito à própria licença.
 - [ProxyScrape Public API](https://docs.proxyscrape.com/api-reference/public-api/get-proxy-list).
 
 Proxies públicos são instáveis e podem observar IP, horário e destinos, embora nenhum certificado seja instalado e o Discord continue usando TLS. A ferramenta altera somente a origem de rede temporária; não modifica dados da conta.
+
+## Limites conhecidos
+
+- A voz do Discord usa UDP e não passa por proxy HTTP: só o gateway e as chamadas HTTPS mudam de origem.
+- Enquanto o proxy está ativo, um PAC corporativo eventualmente configurado fica suspenso e volta ao normal ao final.
+- Remover a configuração afeta apenas conexões novas; a sessão já aberta segue pelo proxy até reconectar.
 
 ## Desenvolvimento
 

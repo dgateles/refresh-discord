@@ -16,6 +16,12 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: Build native executable
         run: msbuild DiscordRefreshProxy.vcxproj /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+      - name: Self-check
+        if: matrix.platform == 'x64'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "artifacts/x64/DiscordRefreshProxy-x64.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Self-check falhou (codigo $($p.ExitCode))" }
       - name: Generate SHA-256
         shell: pwsh
         run: |
