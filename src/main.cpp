@@ -154,7 +154,7 @@ void SaveLast(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Ro
 
 // Devolve todos os aprovados da primeira rodada com sucesso: se o primeiro nao recarregar o Discord, ha suplentes prontos.
 std::vector<Proxy> FindProxies(){
- std::vector<std::pair<std::wstring,std::wstring>> countries={{L"US",L"Estados Unidos"},{L"CA",L"Canadá"},{L"NL",L"Países Baixos"},{L"DE",L"Alemanha"},{L"FR",L"França"},{L"GB",L"Reino Unido"},{L"JP",L"Japão"},{L"SG",L"Singapura"}};
+ std::vector<std::pair<std::wstring,std::wstring>> countries={{L"US",L"Estados Unidos"},{L"MX",L"México"},{L"DE",L"Alemanha"},{L"ES",L"Espanha"},{L"IT",L"Itália"},{L"PT",L"Portugal"},{L"AR",L"Argentina"},{L"UY",L"Uruguai"},{L"PY",L"Paraguai"}};
  Log(L"Buscando listas de proxies em "+std::to_wstring(countries.size())+L" países...");
  std::vector<std::future<std::vector<Proxy>>> lists;for(auto&c:countries)lists.push_back(std::async(std::launch::async,Fetch,c.first,c.second));
  std::vector<Proxy> pool;for(auto&l:lists){auto found=l.get();pool.insert(pool.end(),found.begin(),found.end());}
