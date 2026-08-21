@@ -4,6 +4,7 @@
 #include <winhttp.h>
 #include <commctrl.h>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -27,9 +28,17 @@ constexpr wchar_t kInternetSettings[]=L"Software\\Microsoft\\Windows\\CurrentVer
 constexpr wchar_t kPacPath[]=L"/discord-refresh.pac"; // também serve de marca para limpar sobras de uma execução que morreu
 constexpr wchar_t kBackupName[]=L"previous-autoconfig.txt";
 constexpr wchar_t kBlockedName[]=L"blocked.txt";
-constexpr int kHoldSeconds=45;                        // cobre o ciclo todo: recarga, reconexão do gateway e carga das guilds. Valor calibrado no uso real.
-constexpr int kVerifySeconds=20;                      // parte inicial da espera: tempo dado ao Discord para voltar antes de julgar o proxy
-constexpr size_t kProbeBatch=8,kProbeLimit=24,kMaxAttempts=3;
+constexpr int kHoldSeconds=70;                        // cobre o ciclo todo: recarga, reconexão do gateway e carga das guilds. Valor calibrado no uso real.
+constexpr int kVerifySeconds=40;                      // parte inicial da espera: tempo dado ao Discord para voltar antes de julgar o proxy
+constexpr size_t kProbeBatch=12,kProbeLimit=60,kMaxAttempts=3;
+// O bundle do /app tem ~3,2 MB comprimidos. A 200 KB/s ele chega em ~16 s e a recarga cabe na janela de
+// verificação; a 33 KB/s, que é o que um proxy público típico entrega, levaria mais de um minuto e meio: tela cinza.
+// Barra medida contra a fonte real: numa amostra de 25 proxies públicos, 5 passavam de 200 KB/s e 2 de 300.
+// Daí a amostragem larga — a maior parte da lista é lenta demais e precisa ser descartada em bloco.
+constexpr size_t kSpeedSample=512*1024;
+constexpr DWORD kSpeedBudgetMs=4000;                  // amostra time-boxed: quem não entregou o pedaço em 4 s já se reprovou
+constexpr int kMinKBps=200;
+constexpr long long kBlockDays=7;                     // proxy público troca de dono e de rota em poucos dias; veto eterno só encolhe a lista útil
 HWND g_main{},g_log{},g_button{},g_status{},g_progress{};
 
 // wininet.h e winhttp.h não convivem no mesmo arquivo (INTERNET_* colidem), então a única função que falta vem declarada a mão.
@@ -41,17 +50,26 @@ std::string Utf8(const std::wstring&s){if(s.empty())return{};int n=WideCharToMul
 void Log(const std::wstring&s){auto*copy=new std::wstring(s);if(!PostMessage(g_main,WM_LOG,0,(LPARAM)copy))delete copy;}
 struct Internet{HINTERNET h{};explicit Internet(HINTERNET v=nullptr):h(v){}~Internet(){if(h)WinHttpCloseHandle(h);}operator HINTERNET()const{return h;}};
 
-std::vector<BYTE> Get(const std::wstring&url,const std::wstring&proxy=L"",DWORD timeout=20000){
+// cap corta a leitura assim que houver bytes suficientes (medir vazão não exige baixar 3 MB);
+// anyStatus aceita qualquer resposta HTTP, para os testes em que o que importa é o túnel ter subido.
+// budget é teto de tempo do corpo: o timeout do WinHTTP é por leitura, então um proxy que goteja
+// bytes nunca o dispara e prenderia a rodada inteira. Com o teto, ele volta com o pouco que entregou.
+// readMs devolve só a duração do corpo, sem o handshake, para não cobrar latência como se fosse vazão.
+std::vector<BYTE> Get(const std::wstring&url,const std::wstring&proxy=L"",DWORD timeout=20000,size_t cap=(size_t)-1,bool anyStatus=false,const std::wstring&headers=L"",DWORD budget=0,ULONGLONG*readMs=nullptr){
  URL_COMPONENTS p{sizeof(p)};wchar_t host[256]{},path[2048]{},extra[2048]{};p.lpszHostName=host;p.dwHostNameLength=256;p.lpszUrlPath=path;p.dwUrlPathLength=2048;p.lpszExtraInfo=extra;p.dwExtraInfoLength=2048;
  if(!WinHttpCrackUrl(url.c_str(),0,0,&p))throw std::runtime_error("URL inválida");
  Internet session(WinHttpOpen(L"DiscordRefreshProxy/3.0",proxy.empty()?WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY:WINHTTP_ACCESS_TYPE_NAMED_PROXY,proxy.empty()?WINHTTP_NO_PROXY_NAME:proxy.c_str(),WINHTTP_NO_PROXY_BYPASS,0));
  if(!session.h)throw std::runtime_error("WinHTTP indisponível");WinHttpSetTimeouts(session,timeout,timeout,timeout,timeout);
  Internet connection(WinHttpConnect(session,host,p.nPort,0));DWORD flags=p.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0;std::wstring requestPath=std::wstring(path)+extra;
  Internet request(WinHttpOpenRequest(connection,L"GET",requestPath.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,flags));
- if(!request.h||!WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)||!WinHttpReceiveResponse(request,nullptr))throw std::runtime_error("Falha na requisição HTTPS");
+ if(!request.h||!WinHttpSendRequest(request,headers.empty()?(LPCWSTR)nullptr:headers.c_str(),headers.empty()?(DWORD)0:(DWORD)-1L,WINHTTP_NO_REQUEST_DATA,0,0,0)||!WinHttpReceiveResponse(request,nullptr))throw std::runtime_error("Falha na requisição HTTPS");
  DWORD status{},size=sizeof(status);WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX);
- if(status<200||status>=400)throw std::runtime_error("Servidor respondeu HTTP "+std::to_string(status));
- std::vector<BYTE> out;for(;;){DWORD available{};if(!WinHttpQueryDataAvailable(request,&available))throw std::runtime_error("Falha ao ler resposta");if(!available)break;size_t old=out.size();out.resize(old+available);DWORD read{};if(!WinHttpReadData(request,out.data()+old,available,&read))throw std::runtime_error("Falha no download");out.resize(old+read);}return out;
+ if(!anyStatus&&(status<200||status>=400))throw std::runtime_error("Servidor respondeu HTTP "+std::to_string(status));
+ ULONGLONG body=GetTickCount64();std::vector<BYTE> out;
+ for(;;){DWORD available{};if(!WinHttpQueryDataAvailable(request,&available))throw std::runtime_error("Falha ao ler resposta");if(!available)break;size_t old=out.size();out.resize(old+available);DWORD read{};if(!WinHttpReadData(request,out.data()+old,available,&read))throw std::runtime_error("Falha no download");out.resize(old+read);
+  if(out.size()>=cap)break;if(budget&&GetTickCount64()-body>=budget)break;}
+ if(readMs)*readMs=(std::max)(GetTickCount64()-body,(ULONGLONG)1);
+ return out;
 }
 fs::path Root(){wchar_t b[MAX_PATH]{};if(!GetEnvironmentVariableW(L"LOCALAPPDATA",b,MAX_PATH))throw std::runtime_error("LOCALAPPDATA indisponível");return fs::path(b)/L"DiscordRefreshProxy";}
 
@@ -126,11 +144,29 @@ std::vector<Proxy> Fetch(std::wstring code,std::wstring country){
  try{auto b=Get(L"https://api.proxyscrape.com/v4/free-proxy-list/get?request=getproxies&protocol=http&country="+code+L"&timeout=5000&ssl=yes&anonymity=elite,anonymous&limit=80");
   return ParseProxies(std::string(b.begin(),b.end()),country);}catch(...){return {};}
 }
-// Duas etapas de proposito: o gateway prova alcance, e o HTML do /app e o que o Ctrl+R realmente baixa.
-// Um proxy que passa no primeiro mas engasga no segundo e exatamente o que deixa o Discord na tela cinza.
-bool Probe(std::wstring host,int port){
+// O HTML do /app e so a casca cinza: quem desenha a tela e o bundle que ele manda baixar.
+bool IsAppShell(const std::string&html){return html.find("GLOBAL_ENV")!=std::string::npos&&html.find("/assets/")!=std::string::npos;}
+std::string FirstAsset(const std::string&html){std::smatch m;const std::regex re(R"(/assets/[A-Za-z0-9._-]+\.js)");return std::regex_search(html,m,re)?m.str():std::string{};}
+// Alcance nao era o criterio certo. Medido no proxy que a versao anterior aprovou: HTML em 1 s, CDN e
+// WebSocket de pe, e o bundle a 33 KB/s - mais de um minuto e meio para 3,2 MB, com a janela cinza o tempo todo.
+// Entao o veredito e vazao, medida num pedaco do bundle de verdade. Devolve KB/s, ou 0 se reprovado.
+int Probe(std::wstring host,int port){
  std::wstring via=host+L":"+std::to_wstring(port);
- try{Get(L"https://discord.com/api/v10/gateway",via,5000);return Get(L"https://discord.com/app",via,6000).size()>1024;}catch(...){return false;}
+ try{
+  Get(L"https://gateway.discord.gg/?v=10&encoding=json",via,4000,4096,true); // sem upgrade a resposta e 4xx; o que importa e o tunel do WebSocket ter subido
+  auto raw=Get(L"https://discord.com/app",via,6000,262144);
+  std::string html(raw.begin(),raw.end());std::string asset=FirstAsset(html);
+  if(!IsAppShell(html)||asset.empty())return 0;                              // bloqueio de ISP e portal de captura tambem devolvem 200 com HTML proprio
+  ULONGLONG ms=1;
+  size_t got=Get(L"https://discord.com"+Wide(asset),via,8000,kSpeedSample,false,L"Range: bytes=0-"+std::to_wstring(kSpeedSample-1),kSpeedBudgetMs,&ms).size();
+  int kbps=(int)(got*1000/ms/1024);
+  return kbps>=kMinKBps?kbps:0;
+ }catch(...){return 0;}
+}
+// Durante a espera basta saber se o proxy continua de pe; repetir a medida de vazao so gastaria banda do usuario.
+bool Alive(const std::wstring&host,int port){
+ std::wstring via=host+L":"+std::to_wstring(port);
+ try{auto raw=Get(L"https://discord.com/app",via,6000,262144);return IsAppShell(std::string(raw.begin(),raw.end()));}catch(...){return false;}
 }
 std::wstring Title(HWND w){wchar_t b[512]{};GetWindowTextW(w,b,512);return b;}
 // Veredito conservador: so acusa tela cinza se o titulo saiu do que era e nao voltou.
@@ -147,13 +183,28 @@ bool WaitReload(HWND w,const std::wstring&good,int seconds){
  return watch.AcceptOnTimeout();
 }
 std::string Key(const Proxy&p){return Utf8(p.host)+":"+std::to_string(p.port);}
-std::set<std::string> LoadBlocked(){std::set<std::string> out;try{std::ifstream f(Root()/kBlockedName);for(std::string line;std::getline(f,line);)if(!line.empty())out.insert(line);}catch(...){}return out;}
-void Block(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Root()/kBlockedName,std::ios::app)<<Key(p)<<"\n";}catch(...){}}
+long long Today(){return std::chrono::duration_cast<std::chrono::hours>(std::chrono::system_clock::now().time_since_epoch()).count()/24;}
+// Linha sem data veio do veto antigo, que julgava só pelo título da janela e condenava proxy bom para sempre.
+std::string LiveBlocked(const std::string&line,long long today){
+ size_t bar=line.rfind('|');if(bar==std::string::npos||!bar)return {};
+ try{if(today-std::stoll(line.substr(bar+1))<kBlockDays)return line.substr(0,bar);}catch(...){}
+ return {};
+}
+std::set<std::string> LoadBlocked(){
+ std::set<std::string> out;std::vector<std::string> keep;size_t total=0;long long today=Today();
+ try{
+  {std::ifstream f(Root()/kBlockedName);for(std::string line;std::getline(f,line);){if(line.empty())continue;++total;if(std::string key=LiveBlocked(line,today);!key.empty()){out.insert(key);keep.push_back(line);}}}
+  if(keep.size()!=total){std::ofstream f(Root()/kBlockedName,std::ios::trunc);for(const auto&line:keep)f<<line<<"\n";}
+ }catch(...){}
+ return out;
+}
+void Block(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Root()/kBlockedName,std::ios::app)<<Key(p)<<"|"<<Today()<<"\n";}catch(...){}}
 Proxy LoadLast(){try{std::ifstream f(Root()/L"last-proxy.txt");std::string line;if(!std::getline(f,line))return{};size_t colon=line.rfind(':');if(colon==std::string::npos)return{};return{Wide(line.substr(0,colon)),std::stoi(line.substr(colon+1)),L"último aprovado"};}catch(...){return{};}}
 void SaveLast(const Proxy&p){try{fs::create_directories(Root());std::ofstream(Root()/L"last-proxy.txt")<<Utf8(p.host)<<":"<<p.port;}catch(...){}}
 
-// Devolve todos os aprovados da primeira rodada com sucesso: se o primeiro nao recarregar o Discord, ha suplentes prontos.
-std::vector<Proxy> FindProxies(){
+// Devolve os aprovados ordenados do mais rapido para o mais lento, com a vazao medida junto:
+// se o primeiro nao recarregar o Discord, ha suplentes prontos e ja classificados.
+std::vector<std::pair<int,Proxy>> FindProxies(){
  std::vector<std::pair<std::wstring,std::wstring>> countries={{L"US",L"Estados Unidos"},{L"MX",L"México"},{L"DE",L"Alemanha"},{L"ES",L"Espanha"},{L"IT",L"Itália"},{L"PT",L"Portugal"},{L"AR",L"Argentina"},{L"UY",L"Uruguai"},{L"PY",L"Paraguai"}};
  Log(L"Buscando listas de proxies em "+std::to_wstring(countries.size())+L" países...");
  std::vector<std::future<std::vector<Proxy>>> lists;for(auto&c:countries)lists.push_back(std::async(std::launch::async,Fetch,c.first,c.second));
@@ -165,16 +216,18 @@ std::vector<Proxy> FindProxies(){
  if(pool.empty())throw std::runtime_error("Todos os proxies encontrados já falharam antes. Tente novamente mais tarde.");
  std::mt19937 rng((unsigned)GetTickCount64());std::shuffle(pool.begin(),pool.end(),rng);
  if(Proxy last=LoadLast();!last.host.empty()&&!blocked.count(Key(last)))pool.insert(pool.begin(),last);
- Log(L"Testando até "+std::to_wstring(kProbeLimit)+L" proxies contra o Discord...");
- for(size_t start=0,limit=(std::min)(pool.size(),kProbeLimit);start<limit;start+=kProbeBatch){
+ Log(L"Testando até "+std::to_wstring(kProbeLimit)+L" proxies: mínimo de "+std::to_wstring(kMinKBps)+L" KB/s para dar conta do bundle do Discord.");
+ std::vector<std::pair<int,Proxy>> ranked;
+ for(size_t start=0,limit=(std::min)(pool.size(),kProbeLimit);start<limit&&ranked.size()<kMaxAttempts;start+=kProbeBatch){
   size_t end=(std::min)(start+kProbeBatch,limit);
-  std::vector<std::future<bool>> probes;for(size_t i=start;i<end;++i)probes.push_back(std::async(std::launch::async,Probe,pool[i].host,pool[i].port));
-  std::vector<char> alive(probes.size());for(size_t i=0;i<probes.size();++i)alive[i]=probes[i].get()?1:0;
-  std::vector<Proxy> ok;for(size_t i=0;i<alive.size();++i)if(alive[i])ok.push_back(pool[start+i]);
-  if(!ok.empty())return ok;
-  Log(L"  Nenhum respondeu nesta rodada, tentando a próxima...");
+  std::vector<std::future<int>> probes;for(size_t i=start;i<end;++i)probes.push_back(std::async(std::launch::async,Probe,pool[i].host,pool[i].port));
+  std::vector<int> speed(probes.size());for(size_t i=0;i<probes.size();++i)speed[i]=probes[i].get();
+  for(size_t i=0;i<speed.size();++i)if(speed[i])ranked.push_back({speed[i],pool[start+i]});
+  Log(L"  Rodada "+std::to_wstring(start/kProbeBatch+1)+L": "+std::to_wstring(ranked.size())+L" aprovado(s) até aqui.");
  }
- throw std::runtime_error("Nenhum proxy público funcional encontrado. Tente novamente.");
+ if(ranked.empty())throw std::runtime_error("Nenhum proxy público com velocidade suficiente. Os que responderam entregariam o Discord lento demais e a tela ficaria cinza. Tente de novo em alguns minutos.");
+ std::sort(ranked.begin(),ranked.end(),[](const auto&a,const auto&b){return a.first>b.first;});
+ return ranked;
 }
 
 BOOL CALLBACK DiscordEnum(HWND w,LPARAM out){if(!IsWindowVisible(w))return TRUE;DWORD pid{};GetWindowThreadProcessId(w,&pid);HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!h)return TRUE;wchar_t path[32768]{};DWORD n=32768;QueryFullProcessImageNameW(h,0,path,&n);CloseHandle(h);std::wstring name=fs::path(path).filename().wstring();std::transform(name.begin(),name.end(),name.begin(),::towlower);if(name==L"discord.exe"||name==L"discordcanary.exe"||name==L"discordptb.exe"||name==L"discorddevelopment.exe"){*(HWND*)out=w;return FALSE;}return TRUE;}
@@ -185,11 +238,12 @@ DWORD WINAPI Worker(LPVOID){
  try{
   HWND discord=Discord();if(!discord)throw std::runtime_error("Abra o Discord antes de continuar");Log(L"Discord encontrado.");
   std::wstring good=Title(discord); // título com o Discord carregado: é a ele que a janela precisa voltar depois do Ctrl+R
-  std::vector<Proxy> candidates=FindProxies();
-  Log(std::to_wstring(candidates.size())+L" proxy(s) passaram no teste de carga.");
+  if(good.empty()||good==L"Discord")Log(L"Aviso: o título da janela não mostra um canal, então a recarga não pode ser julgada por ele. Abra um canal antes de clicar para o descarte automático funcionar.");
+  std::vector<std::pair<int,Proxy>> candidates=FindProxies();
+  Log(std::to_wstring(candidates.size())+L" proxy(s) passaram no teste de vazão.");
   for(size_t attempt=0;attempt<candidates.size()&&attempt<kMaxAttempts;++attempt){
-   const Proxy&proxy=candidates[attempt];
-   Log(L"Tentativa "+std::to_wstring(attempt+1)+L": "+proxy.host+L":"+std::to_wstring(proxy.port)+L" - "+proxy.country);
+   const Proxy&proxy=candidates[attempt].second;
+   Log(L"Tentativa "+std::to_wstring(attempt+1)+L": "+proxy.host+L":"+std::to_wstring(proxy.port)+L" - "+proxy.country+L" - "+std::to_wstring(candidates[attempt].first)+L" KB/s");
    Pac pac;pac.Start(PacScript(proxy));
    ProxyScope scope(L"http://127.0.0.1:"+std::to_wstring(pac.port)+kPacPath);
    Log(pac.WaitFetch(4000)?L"Discord leu a configuração.":L"Sem confirmação de leitura, seguindo assim mesmo.");
@@ -205,7 +259,7 @@ DWORD WINAPI Worker(LPVOID){
     int remaining=kHoldSeconds-(int)((GetTickCount64()-began)/1000);
     if(remaining<=0)break;
     SetWindowTextW(g_status,(L"AGUARDE "+std::to_wstring(remaining)+L"s").c_str());Sleep(1000);
-    if(lastProbe-remaining>=15){lastProbe=remaining;if(!Probe(proxy.host,proxy.port))throw std::runtime_error("O proxy caiu antes de a recarga terminar");}
+    if(lastProbe-remaining>=15){lastProbe=remaining;if(!Alive(proxy.host,proxy.port))throw std::runtime_error("O proxy caiu antes de a recarga terminar");}
    }
    SaveLast(proxy);scope.Release();
    Log(L"Configuração lida "+std::to_wstring(pac.hits.load())+L" vez(es). Proxy removido.");
@@ -235,6 +289,14 @@ int SelfTest(){
  ReloadWatch mudo(L"Discord");
  mudo.Reloaded(L"Discord");
  if(!mudo.AcceptOnTimeout())return 1;                 // título nunca mudou: inconclusivo, não culpa o proxy
+ const std::string shell="<script>window.GLOBAL_ENV={};</script><link href=\"/assets/a.css\"><script src=\"/assets/web.e7ec05b4.js\"></script>";
+ if(!IsAppShell(shell))return 1;
+ if(IsAppShell("<html><head><title>Acesso bloqueado</title></head><body>Politica de uso</body></html>"))return 1;
+ if(FirstAsset(shell)!="/assets/web.e7ec05b4.js")return 1;  // o .css vem antes no HTML e nao pode ser escolhido
+ if(!FirstAsset("<html>sem bundle</html>").empty())return 1;
+ if(LiveBlocked("1.2.3.4:8080|100",100)!="1.2.3.4:8080")return 1;
+ if(!LiveBlocked("1.2.3.4:8080|100",100+kBlockDays).empty())return 1;  // veto vence e o proxy volta ao sorteio
+ if(!LiveBlocked("1.2.3.4:8080",100).empty())return 1;                 // formato antigo, sem data
  return 0;
 }
 
