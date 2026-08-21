@@ -28,8 +28,8 @@ constexpr wchar_t kInternetSettings[]=L"Software\\Microsoft\\Windows\\CurrentVer
 constexpr wchar_t kPacPath[]=L"/discord-refresh.pac"; // também serve de marca para limpar sobras de uma execução que morreu
 constexpr wchar_t kBackupName[]=L"previous-autoconfig.txt";
 constexpr wchar_t kBlockedName[]=L"blocked.txt";
-constexpr int kHoldSeconds=70;                        // cobre o ciclo todo: recarga, reconexão do gateway e carga das guilds. Valor calibrado no uso real.
-constexpr int kVerifySeconds=40;                      // parte inicial da espera: tempo dado ao Discord para voltar antes de julgar o proxy
+constexpr int kVerifySeconds=40;                      // tempo dado ao Discord para voltar antes de julgar o proxy
+constexpr int kGraceSeconds=10;                       // folga depois da recarga confirmada, para o que o Discord ainda pede logo após montar
 constexpr size_t kProbeBatch=12,kProbeLimit=60,kMaxAttempts=3;
 // O bundle do /app tem ~3,2 MB comprimidos. A 200 KB/s ele chega em ~16 s e a recarga cabe na janela de
 // verificação; a 33 KB/s, que é o que um proxy público típico entrega, levaria mais de um minuto e meio: tela cinza.
@@ -163,11 +163,6 @@ int Probe(std::wstring host,int port){
   return kbps>=kMinKBps?kbps:0;
  }catch(...){return 0;}
 }
-// Durante a espera basta saber se o proxy continua de pe; repetir a medida de vazao so gastaria banda do usuario.
-bool Alive(const std::wstring&host,int port){
- std::wstring via=host+L":"+std::to_wstring(port);
- try{auto raw=Get(L"https://discord.com/app",via,6000,262144);return IsAppShell(std::string(raw.begin(),raw.end()));}catch(...){return false;}
-}
 std::wstring Title(HWND w){wchar_t b[512]{};GetWindowTextW(w,b,512);return b;}
 // Veredito conservador: so acusa tela cinza se o titulo saiu do que era e nao voltou.
 // Falso negativo custa uma tentativa a mais; falso positivo descartaria um proxy bom para sempre.
@@ -247,20 +242,16 @@ DWORD WINAPI Worker(LPVOID){
    Pac pac;pac.Start(PacScript(proxy));
    ProxyScope scope(L"http://127.0.0.1:"+std::to_wstring(pac.port)+kPacPath);
    Log(pac.WaitFetch(4000)?L"Discord leu a configuração.":L"Sem confirmação de leitura, seguindo assim mesmo.");
-   ULONGLONG began=GetTickCount64();
    Refresh(discord);SetWindowTextW(g_status,L"RECARREGANDO");
    if(!WaitReload(discord,good,kVerifySeconds)){
     Block(proxy);Log(L"O Discord não voltou da recarga (tela cinza). Proxy descartado de vez.");
     continue; // o PAC deste proxy sai de cena aqui, antes da próxima tentativa
    }
-   Log(L"Recarga confirmada. Segurando o proxy até completar os "+std::to_wstring(kHoldSeconds)+L"s.");
-   // Um proxy público pode morrer no meio; sem esse teste o usuário veria "concluído" com o Discord pela metade.
-   for(int lastProbe=kHoldSeconds;;){
-    int remaining=kHoldSeconds-(int)((GetTickCount64()-began)/1000);
-    if(remaining<=0)break;
-    SetWindowTextW(g_status,(L"AGUARDE "+std::to_wstring(remaining)+L"s").c_str());Sleep(1000);
-    if(lastProbe-remaining>=15){lastProbe=remaining;if(!Alive(proxy.host,proxy.port))throw std::runtime_error("O proxy caiu antes de a recarga terminar");}
-   }
+   // O título só volta quando a interface montou, então a essa altura o bundle já desceu inteiro e o
+   // que resta são requisições curtas. A folga cobre essas, e é contada da confirmação, não do Ctrl+R:
+   // esperar um prazo fixo desde a recarga cobrava do usuário um tempo que a evidência já dispensava.
+   Log(L"Recarga confirmada. Segurando o proxy por mais "+std::to_wstring(kGraceSeconds)+L"s.");
+   for(int remaining=kGraceSeconds;remaining>0;--remaining){SetWindowTextW(g_status,(L"AGUARDE "+std::to_wstring(remaining)+L"s").c_str());Sleep(1000);}
    SaveLast(proxy);scope.Release();
    Log(L"Configuração lida "+std::to_wstring(pac.hits.load())+L" vez(es). Proxy removido.");
    Log(L"Concluído usando saída em "+proxy.country+L".");
